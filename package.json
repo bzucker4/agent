@@ -10,6 +10,7 @@
   "dependencies": {
     "@slack/bolt": "^3.19.0",
     "dotenv": "^16.4.5",
-    "groq-sdk": "^0.7.0"
+    "groq-sdk": "^0.7.0",
+    "pdf-lib": "^1.17.1"
   }
 }
