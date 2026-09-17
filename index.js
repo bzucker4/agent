@@ -1,8 +1,11 @@
 require('dotenv').config();
 
+const fs = require('fs');
+const path = require('path');
 const { App } = require('@slack/bolt');
 const Groq = require('groq-sdk');
 const { PDFDocument, StandardFonts } = require('pdf-lib');
+const { google } = require('googleapis');
 
 const SYSTEM_PROMPT =
   'You are Agent, a helpful and concise assistant in this Slack workspace. ' +
@@ -33,6 +36,33 @@ const PDF_FALLBACK_MESSAGE =
 
 const PDF_TRIGGER_REGEX = /^pdf:\s*/i;
 
+const EMAIL_DRAFT_SYSTEM_PROMPT =
+  'You draft the body of an email based on a short description of what it should say. ' +
+  'Write a complete, ready-to-send email: include an appropriate greeting and sign-off, ' +
+  'be clear and professional, and match the tone implied by the description. ' +
+  'Respond with ONLY the email body text (no subject line, no explanations, no markdown formatting).';
+
+const EMAIL_TRIGGER_REGEX = /^email:\s*/i;
+const EMAIL_PARSE_REGEX = /^to\s+(.+?)\s*\|\s*subject:\s*(.+?)\s*\|\s*([\s\S]+)$/i;
+const EMAIL_ADDRESS_REGEX = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+const CONFIRM_SEND_REGEX = /^send it$/i;
+const CANCEL_DRAFT_REGEX = /^cancel$/i;
+const EMAIL_MAX_TOKENS = 500;
+const PENDING_DRAFT_EXPIRY_MS = 10 * 60 * 1000;
+const CREDENTIALS_PATH = path.join(__dirname, 'credentials.json');
+const TOKEN_PATH = path.join(__dirname, 'token.json');
+const EMAIL_FORMAT_ERROR_MESSAGE =
+  "Sorry, I couldn't parse that. Use this format:\n" +
+  '`email: to <address> | subject: <subject> | <description of what to write>`';
+const EMAIL_DRAFT_FALLBACK_MESSAGE =
+  "Sorry, I couldn't draft that email right now. Please try again in a moment.";
+const EMAIL_SEND_FALLBACK_MESSAGE =
+  "Sorry, I couldn't send that email right now. Please try again in a moment.";
+const EMAIL_NOT_CONFIGURED_MESSAGE =
+  "Email isn't set up yet. Run `node authorize-gmail.js` in the project folder to connect Gmail, then try again.";
+const EMAIL_NOT_AUTHORIZED_MESSAGE = "Sorry, you're not authorized to use the email feature.";
+const ALLOWED_EMAIL_USER_ID = process.env.ALLOWED_EMAIL_USER_ID || '';
+
 const PAGE_WIDTH = 612; // US Letter, points
 const PAGE_HEIGHT = 792;
 const PAGE_MARGIN = 50;
@@ -55,6 +85,45 @@ const app = new App({
 
 // threadKey -> array of { role, content }, most recent MAX_HISTORY_MESSAGES kept
 const conversations = new Map();
+
+// threadKey -> { to, subject, body, timeoutHandle }; separate from
+// `conversations` since drafts are never part of chat history.
+const pendingDrafts = new Map();
+
+function initGmailClient() {
+  try {
+    const credentials = JSON.parse(fs.readFileSync(CREDENTIALS_PATH, 'utf8'));
+    const token = JSON.parse(fs.readFileSync(TOKEN_PATH, 'utf8'));
+    const { client_id, client_secret, redirect_uris } = credentials.installed || credentials.web;
+    const oauth2Client = new google.auth.OAuth2(client_id, client_secret, redirect_uris[0]);
+    oauth2Client.setCredentials(token);
+
+    // googleapis refreshes the access token automatically using the refresh
+    // token; persist whatever it issues so restarts don't need reauthorization.
+    oauth2Client.on('tokens', (newTokens) => {
+      try {
+        fs.writeFileSync(TOKEN_PATH, JSON.stringify({ ...token, ...newTokens }, null, 2));
+      } catch (err) {
+        console.error('Failed to persist refreshed Gmail token:', err);
+      }
+    });
+
+    return google.gmail({ version: 'v1', auth: oauth2Client });
+  } catch (error) {
+    console.warn('Gmail not configured (missing/invalid credentials.json or token.json). Run `node authorize-gmail.js` to enable email. Error:', error.message);
+    return null;
+  }
+}
+
+const gmail = initGmailClient();
+
+if (gmail && !ALLOWED_EMAIL_USER_ID) {
+  console.warn('ALLOWED_EMAIL_USER_ID is not set — the email feature is disabled for everyone until it is configured.');
+}
+
+function isAuthorizedForEmail(userId) {
+  return Boolean(ALLOWED_EMAIL_USER_ID) && userId === ALLOWED_EMAIL_USER_ID;
+}
 
 function truncate(text) {
   if (text.length <= MAX_MESSAGE_CHARS) return text;
@@ -82,6 +151,87 @@ function isPdfRequest(text) {
 
 function extractPdfInstruction(text) {
   return text.replace(PDF_TRIGGER_REGEX, '').trim();
+}
+
+function isEmailRequest(text) {
+  return EMAIL_TRIGGER_REGEX.test(text);
+}
+
+// Slack auto-linkifies email addresses as <mailto:foo@bar.com|foo@bar.com>
+// (or plain <foo@bar.com>) in the raw message text, so unwrap that first.
+function extractEmailAddress(raw) {
+  const mailto = raw.match(/<mailto:([^|>]+)(?:\|[^>]*)?>/i);
+  if (mailto) return mailto[1].trim();
+  const angled = raw.match(/^<([^>]+)>$/);
+  if (angled) return angled[1].trim();
+  return raw.trim();
+}
+
+function parseEmailRequest(text) {
+  const rest = text.replace(EMAIL_TRIGGER_REGEX, '');
+  const match = rest.match(EMAIL_PARSE_REGEX);
+  if (!match) return null;
+
+  const [, rawTo, rawSubject, rawInstruction] = match;
+  const to = extractEmailAddress(rawTo);
+  const subject = rawSubject.trim();
+  const instruction = rawInstruction.trim();
+  if (!EMAIL_ADDRESS_REGEX.test(to) || !subject || !instruction) return null;
+
+  return { to, subject, instruction };
+}
+
+function isConfirmSend(text) {
+  return CONFIRM_SEND_REGEX.test(text.trim());
+}
+
+function isCancelDraft(text) {
+  return CANCEL_DRAFT_REGEX.test(text.trim());
+}
+
+function setPendingDraft(threadKey, draft) {
+  clearPendingDraft(threadKey);
+  const timeoutHandle = setTimeout(() => pendingDrafts.delete(threadKey), PENDING_DRAFT_EXPIRY_MS);
+  pendingDrafts.set(threadKey, { ...draft, timeoutHandle });
+}
+
+function clearPendingDraft(threadKey) {
+  const existing = pendingDrafts.get(threadKey);
+  if (existing) clearTimeout(existing.timeoutHandle);
+  pendingDrafts.delete(threadKey);
+}
+
+function formatDraftPreview({ to, subject, body }) {
+  return (
+    `📧 *Draft email*\n` +
+    `*To:* ${to}\n` +
+    `*Subject:* ${subject}\n` +
+    `*Body:*\n${body}\n\n` +
+    `Reply *"send it"* to send, or *"cancel"* to discard (expires in 10 min).`
+  );
+}
+
+function encodeEmailSubject(subject) {
+  return /^[\x00-\x7F]*$/.test(subject)
+    ? subject
+    : `=?UTF-8?B?${Buffer.from(subject, 'utf8').toString('base64')}?=`;
+}
+
+function buildRawEmail({ to, subject, body }) {
+  const message = [
+    `To: ${to}`,
+    'MIME-Version: 1.0',
+    'Content-Type: text/plain; charset="UTF-8"',
+    `Subject: ${encodeEmailSubject(subject)}`,
+    '',
+    body,
+  ].join('\n');
+
+  return Buffer.from(message)
+    .toString('base64')
+    .replace(/\+/g, '-')
+    .replace(/\//g, '_')
+    .replace(/=+$/, '');
 }
 
 function toSlackFormatting(text) {
@@ -195,6 +345,27 @@ async function getPdfContent(instruction) {
     const raw = completion.choices?.[0]?.message?.content || '';
     return normalizePdfContent(JSON.parse(raw));
   });
+}
+
+async function draftEmailBody(subject, instruction) {
+  const messages = [
+    { role: 'system', content: EMAIL_DRAFT_SYSTEM_PROMPT },
+    { role: 'user', content: truncate(`Subject: ${subject}\n\nInstructions: ${instruction}`) },
+  ];
+
+  return withRetry(async (signal) => {
+    const completion = await groq.chat.completions.create(
+      { model: MODEL, messages, max_tokens: EMAIL_MAX_TOKENS },
+      { signal }
+    );
+    return (completion.choices?.[0]?.message?.content || '').trim();
+  });
+}
+
+async function sendGmailMessage(draft) {
+  return withRetry((signal) =>
+    gmail.users.messages.send({ userId: 'me', requestBody: { raw: buildRawEmail(draft) } }, { signal })
+  );
 }
 
 function wrapText(text, font, fontSize, maxWidth) {
@@ -380,12 +551,100 @@ async function handlePdfRequest({ client, channel, threadTs, instruction }) {
   }
 }
 
+async function handleEmailDraftRequest({ client, channel, threadTs, threadKey, to, subject, instruction }) {
+  const initial = await client.chat.postMessage({
+    channel,
+    thread_ts: threadTs,
+    text: 'thinking... (drafting email)',
+  });
+
+  try {
+    const body = await draftEmailBody(subject, instruction);
+    if (!body) throw new Error('Empty draft body');
+
+    setPendingDraft(threadKey, { to, subject, body });
+
+    await client.chat.update({
+      channel,
+      ts: initial.ts,
+      text: formatDraftPreview({ to, subject, body }),
+    });
+  } catch (error) {
+    console.error('Email draft failed:', error);
+    await client.chat.update({
+      channel,
+      ts: initial.ts,
+      text: EMAIL_DRAFT_FALLBACK_MESSAGE,
+    });
+  }
+}
+
+async function handleSendConfirmation({ client, channel, threadTs, threadKey }) {
+  const draft = pendingDrafts.get(threadKey);
+  clearPendingDraft(threadKey);
+  if (!draft) return;
+
+  const initial = await client.chat.postMessage({ channel, thread_ts: threadTs, text: 'sending...' });
+
+  try {
+    await sendGmailMessage(draft);
+    await client.chat.update({
+      channel,
+      ts: initial.ts,
+      text: `✅ Email sent to ${draft.to}.`,
+    });
+  } catch (error) {
+    console.error('Gmail send failed:', error);
+    await client.chat.update({
+      channel,
+      ts: initial.ts,
+      text: EMAIL_SEND_FALLBACK_MESSAGE,
+    });
+  }
+}
+
+async function handleCancelDraft({ client, channel, threadTs, threadKey }) {
+  const hadDraft = pendingDrafts.has(threadKey);
+  clearPendingDraft(threadKey);
+  if (!hadDraft) return;
+  await client.chat.postMessage({ channel, thread_ts: threadTs, text: '🗑️ Draft discarded.' });
+}
+
 app.event('app_mention', async ({ event, client }) => {
   try {
     const threadTs = event.thread_ts || event.ts;
     const threadKey = `${event.channel}:${threadTs}`;
     const userText = stripMention(event.text || '');
     if (!userText) return;
+
+    if (pendingDrafts.has(threadKey) && isAuthorizedForEmail(event.user)) {
+      if (isConfirmSend(userText)) {
+        await handleSendConfirmation({ client, channel: event.channel, threadTs, threadKey });
+        return;
+      }
+      if (isCancelDraft(userText)) {
+        await handleCancelDraft({ client, channel: event.channel, threadTs, threadKey });
+        return;
+      }
+    }
+
+    if (isEmailRequest(userText)) {
+      if (!isAuthorizedForEmail(event.user)) {
+        await client.chat.postMessage({ channel: event.channel, thread_ts: threadTs, text: EMAIL_NOT_AUTHORIZED_MESSAGE });
+        return;
+      }
+      if (!gmail) {
+        await client.chat.postMessage({ channel: event.channel, thread_ts: threadTs, text: EMAIL_NOT_CONFIGURED_MESSAGE });
+        return;
+      }
+      const parsed = parseEmailRequest(userText);
+      if (!parsed) {
+        await client.chat.postMessage({ channel: event.channel, thread_ts: threadTs, text: EMAIL_FORMAT_ERROR_MESSAGE });
+        return;
+      }
+      await handleEmailDraftRequest({ client, channel: event.channel, threadTs, threadKey, ...parsed });
+      return;
+    }
 
     if (isPdfRequest(userText)) {
       const instruction = extractPdfInstruction(userText);
@@ -414,6 +673,41 @@ app.message(async ({ message, client }) => {
     const threadKey = `${message.channel}:dm`;
     const userText = (message.text || '').trim();
     if (!userText) return;
+
+    if (pendingDrafts.has(threadKey) && isAuthorizedForEmail(message.user)) {
+      if (isConfirmSend(userText)) {
+        await handleSendConfirmation({ client, channel: message.channel, threadTs: message.thread_ts, threadKey });
+        return;
+      }
+      if (isCancelDraft(userText)) {
+        await handleCancelDraft({ client, channel: message.channel, threadTs: message.thread_ts, threadKey });
+        return;
+      }
+    }
+
+    if (isEmailRequest(userText)) {
+      if (!isAuthorizedForEmail(message.user)) {
+        await client.chat.postMessage({ channel: message.channel, thread_ts: message.thread_ts, text: EMAIL_NOT_AUTHORIZED_MESSAGE });
+        return;
+      }
+      if (!gmail) {
+        await client.chat.postMessage({ channel: message.channel, thread_ts: message.thread_ts, text: EMAIL_NOT_CONFIGURED_MESSAGE });
+        return;
+      }
+      const parsed = parseEmailRequest(userText);
+      if (!parsed) {
+        await client.chat.postMessage({ channel: message.channel, thread_ts: message.thread_ts, text: EMAIL_FORMAT_ERROR_MESSAGE });
+        return;
+      }
+      await handleEmailDraftRequest({
+        client,
+        channel: message.channel,
+        threadTs: message.thread_ts,
+        threadKey,
+        ...parsed,
+      });
+      return;
+    }
 
     if (isPdfRequest(userText)) {
       const instruction = extractPdfInstruction(userText);
