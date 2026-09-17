@@ -8,6 +8,7 @@ A Slack bot named **Agent** that answers when @mentioned in a channel or message
 - Posts a "thinking..." placeholder, then edits it in place as the response streams in (`chat.update`), rather than waiting for the full completion.
 - Keeps the last 6 messages of context per thread in an in-memory `Map` (no database) — each message truncated to 500 characters before being sent to the model.
 - **PDF generation**: a message starting with `pdf:` (case-insensitive) generates a one-page PDF instead of a chat reply — see [PDF generation](#pdf-generation) below.
+- **Search mode**: a message starting with `search:` (case-insensitive) routes the request to Groq's `groq/compound` model instead of the default chat model, for questions that benefit from web-grounded answers.
 - One retry with exponential backoff on Groq API errors/rate limits, a 15s request timeout, and a clean fallback message on failure (applies to the plain-chat completion, the PDF content-structuring call, and the file upload step).
 
 ## Prerequisites

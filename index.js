@@ -17,6 +17,8 @@ const PDF_SYSTEM_PROMPT =
   '(1-3 sentences) and/or up to 5 short bullets.';
 
 const MODEL = 'openai/gpt-oss-20b';
+const SEARCH_MODEL = 'groq/compound';
+const SEARCH_TRIGGER = /^search:\s*/i;
 const MAX_TOKENS = 500;
 const PDF_MAX_TOKENS = 1200;
 const MAX_HISTORY_MESSAGES = 6;
@@ -82,6 +84,25 @@ function extractPdfInstruction(text) {
   return text.replace(PDF_TRIGGER_REGEX, '').trim();
 }
 
+function toSlackFormatting(text) {
+  // Convert **bold** -> *bold* (Slack mrkdwn uses single asterisks for bold)
+  let out = text.replace(/\*\*(.+?)\*\*/g, '*$1*');
+  // Convert markdown headers (## Heading) into bold lines
+  out = out.replace(/^#{1,6}\s*(.+)$/gm, '*$1*');
+  return out;
+}
+
+// Detects a leading "search:" trigger, strips it, and reports which model to use
+function resolveModelAndText(rawText) {
+  if (SEARCH_TRIGGER.test(rawText)) {
+    return {
+      model: SEARCH_MODEL,
+      text: rawText.replace(SEARCH_TRIGGER, '').trim(),
+    };
+  }
+  return { model: MODEL, text: rawText };
+}
+
 function sleep(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
@@ -96,7 +117,7 @@ async function withTimeout(promiseFactory, ms, abortController) {
   return Promise.race([promiseFactory(), timeout]);
 }
 
-// Shared one-retry-with-backoff + timeout wrapper for both Groq calls and the
+// Shared one-retry-with-backoff + timeout wrapper for Groq calls and the
 // Slack file upload step.
 async function withRetry(requestFn) {
   let lastError;
@@ -115,12 +136,12 @@ async function withRetry(requestFn) {
   throw lastError;
 }
 
-async function streamGroqCompletion(messages, onDelta) {
+async function streamGroqCompletion(model, messages, onDelta) {
   return withRetry(async (signal) => {
     let fullText = '';
     const stream = await groq.chat.completions.create(
       {
-        model: MODEL,
+        model,
         messages,
         max_tokens: MAX_TOKENS,
         stream: true,
@@ -266,7 +287,10 @@ function slugifyFilename(title) {
 }
 
 async function handleMessage({ client, channel, threadKey, threadTs, userText }) {
-  appendToHistory(threadKey, 'user', userText);
+  const { model, text: cleanText } = resolveModelAndText(userText);
+  if (!cleanText) return;
+
+  appendToHistory(threadKey, 'user', cleanText);
 
   const messages = [
     { role: 'system', content: SYSTEM_PROMPT },
@@ -276,7 +300,7 @@ async function handleMessage({ client, channel, threadKey, threadTs, userText })
   const initial = await client.chat.postMessage({
     channel,
     thread_ts: threadTs,
-    text: 'thinking...',
+    text: model === SEARCH_MODEL ? 'searching...' : 'thinking...',
   });
 
   let lastUpdateAt = 0;
@@ -298,12 +322,12 @@ async function handleMessage({ client, channel, threadKey, threadTs, userText })
   };
 
   try {
-    const fullText = await streamGroqCompletion(messages, (partial) => {
+    const fullText = await streamGroqCompletion(model, messages, (partial) => {
       latestText = partial;
       flushUpdate(false);
     });
 
-    latestText = fullText.trim() || "I don't have a response for that.";
+    latestText = toSlackFormatting(fullText.trim() || "I don't have a response for that.");
     await client.chat.update({
       channel,
       ts: initial.ts,
