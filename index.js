@@ -90,27 +90,51 @@ const conversations = new Map();
 // `conversations` since drafts are never part of chat history.
 const pendingDrafts = new Map();
 
+// Prefers GOOGLE_CREDENTIALS_JSON / GOOGLE_TOKEN_JSON env vars (for
+// deployments like Railway where the filesystem doesn't carry gitignored
+// files), falling back to the local credentials.json / token.json files
+// used by `authorize-gmail.js` for local dev.
+function loadGmailAuthSource() {
+  if (process.env.GOOGLE_CREDENTIALS_JSON && process.env.GOOGLE_TOKEN_JSON) {
+    return {
+      credentials: JSON.parse(process.env.GOOGLE_CREDENTIALS_JSON),
+      token: JSON.parse(process.env.GOOGLE_TOKEN_JSON),
+      persistRefreshedToken: false,
+    };
+  }
+  return {
+    credentials: JSON.parse(fs.readFileSync(CREDENTIALS_PATH, 'utf8')),
+    token: JSON.parse(fs.readFileSync(TOKEN_PATH, 'utf8')),
+    persistRefreshedToken: true,
+  };
+}
+
 function initGmailClient() {
   try {
-    const credentials = JSON.parse(fs.readFileSync(CREDENTIALS_PATH, 'utf8'));
-    const token = JSON.parse(fs.readFileSync(TOKEN_PATH, 'utf8'));
+    const { credentials, token, persistRefreshedToken } = loadGmailAuthSource();
     const { client_id, client_secret, redirect_uris } = credentials.installed || credentials.web;
     const oauth2Client = new google.auth.OAuth2(client_id, client_secret, redirect_uris[0]);
     oauth2Client.setCredentials(token);
 
     // googleapis refreshes the access token automatically using the refresh
-    // token; persist whatever it issues so restarts don't need reauthorization.
-    oauth2Client.on('tokens', (newTokens) => {
-      try {
-        fs.writeFileSync(TOKEN_PATH, JSON.stringify({ ...token, ...newTokens }, null, 2));
-      } catch (err) {
-        console.error('Failed to persist refreshed Gmail token:', err);
-      }
-    });
+    // token. When running off local files, persist whatever it issues so
+    // restarts don't need reauthorization; when running off env vars
+    // (Railway's filesystem is ephemeral per-deploy), there's nowhere
+    // durable to write it, so the refresh token in the env var must keep
+    // being valid instead.
+    if (persistRefreshedToken) {
+      oauth2Client.on('tokens', (newTokens) => {
+        try {
+          fs.writeFileSync(TOKEN_PATH, JSON.stringify({ ...token, ...newTokens }, null, 2));
+        } catch (err) {
+          console.error('Failed to persist refreshed Gmail token:', err);
+        }
+      });
+    }
 
     return google.gmail({ version: 'v1', auth: oauth2Client });
   } catch (error) {
-    console.warn('Gmail not configured (missing/invalid credentials.json or token.json). Run `node authorize-gmail.js` to enable email. Error:', error.message);
+    console.warn('Gmail not configured (missing/invalid credentials.json or token.json, or GOOGLE_CREDENTIALS_JSON/GOOGLE_TOKEN_JSON). Run `node authorize-gmail.js` to enable email. Error:', error.message);
     return null;
   }
 }
