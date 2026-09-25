@@ -45,8 +45,8 @@ const EMAIL_DRAFT_SYSTEM_PROMPT =
 const EMAIL_TRIGGER_REGEX = /^email:\s*/i;
 const EMAIL_PARSE_REGEX = /^to\s+(.+?)\s*\|\s*subject:\s*(.+?)\s*\|\s*([\s\S]+)$/i;
 const EMAIL_ADDRESS_REGEX = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
-const CONFIRM_SEND_REGEX = /^send it$/i;
-const CANCEL_DRAFT_REGEX = /^cancel$/i;
+const CONFIRM_SEND_PHRASES = ['send', 'send it', 'yes', 'yes send it', 'confirm'];
+const CANCEL_DRAFT_PHRASES = ['cancel', 'no', 'discard'];
 const EMAIL_MAX_TOKENS = 500;
 const PENDING_DRAFT_EXPIRY_MS = 10 * 60 * 1000;
 const CREDENTIALS_PATH = path.join(__dirname, 'credentials.json');
@@ -181,12 +181,29 @@ function parseEmailRequest(text) {
   return { to, subject, instruction };
 }
 
+// Strips a leading @mention (harmless no-op if there isn't one, so this is
+// safe to call from both the DM and channel-mention paths), lowercases, and
+// drops trailing punctuation/whitespace, so "@Agent send it", "Send It!",
+// "send it.", and a plain DM "send" all match the same way. Without the
+// punctuation strip, a perfectly natural reply like "Send it!" would miss
+// the phrase list entirely and silently fall through to the general chat
+// handler instead of confirming the send.
+function normalizeReply(text) {
+  return stripMention(text)
+    .trim()
+    .toLowerCase()
+    .replace(/[.!?]+$/, '')
+    .replace(/,/g, '')
+    .replace(/\s+/g, ' ')
+    .trim();
+}
+
 function isConfirmSend(text) {
-  return CONFIRM_SEND_REGEX.test(text.trim());
+  return CONFIRM_SEND_PHRASES.includes(normalizeReply(text));
 }
 
 function isCancelDraft(text) {
-  return CANCEL_DRAFT_REGEX.test(text.trim());
+  return CANCEL_DRAFT_PHRASES.includes(normalizeReply(text));
 }
 
 function setPendingDraft(threadKey, draft) {
