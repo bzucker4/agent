@@ -69,6 +69,8 @@ You should see:
 
 Replies in a channel are posted as a thread reply to the mention; DM context is kept per-DM-channel across messages (last 6 messages, each capped at 500 characters).
 
+Once the bot has replied in a channel thread, further replies in that same thread don't need another `@Agent` mention — any plain reply there is treated as directed at the bot. Mentioning it again also still works (and is what's required to address it in a brand-new thread). This doesn't apply across different threads or to unrelated channel messages — only to a thread the bot has already posted into.
+
 ## PDF generation
 
 Start a message with `pdf:` (case-insensitive) to get a one-page PDF instead of a chat reply:

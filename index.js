@@ -56,6 +56,15 @@ const app = new App({
 // threadKey -> array of { role, content }, most recent MAX_HISTORY_MESSAGES kept
 const conversations = new Map();
 
+// channel:threadTs keys the bot has actually posted into, so a later reply in
+// that thread can be treated as directed at the bot without needing another
+// @mention.
+const engagedThreads = new Set();
+
+function threadKeyFor(channel, threadTs) {
+  return threadTs ? `${channel}:${threadTs}` : null;
+}
+
 function truncate(text) {
   if (text.length <= MAX_MESSAGE_CHARS) return text;
   return text.slice(0, MAX_MESSAGE_CHARS);
@@ -302,6 +311,8 @@ async function handleMessage({ client, channel, threadKey, threadTs, userText })
     thread_ts: threadTs,
     text: model === SEARCH_MODEL ? 'searching...' : 'thinking...',
   });
+  const realThreadKey = threadKeyFor(channel, threadTs);
+  if (realThreadKey) engagedThreads.add(realThreadKey);
 
   let lastUpdateAt = 0;
   let latestText = '';
@@ -351,6 +362,8 @@ async function handlePdfRequest({ client, channel, threadTs, instruction }) {
     thread_ts: threadTs,
     text: 'thinking... (generating PDF)',
   });
+  const realThreadKey = threadKeyFor(channel, threadTs);
+  if (realThreadKey) engagedThreads.add(realThreadKey);
 
   try {
     const content = await getPdfContent(instruction);
@@ -380,6 +393,17 @@ async function handlePdfRequest({ client, channel, threadTs, instruction }) {
   }
 }
 
+async function routeIncomingText({ client, channel, threadKey, threadTs, userText }) {
+  if (isPdfRequest(userText)) {
+    const instruction = extractPdfInstruction(userText);
+    if (!instruction) return;
+    await handlePdfRequest({ client, channel, threadTs, instruction });
+    return;
+  }
+
+  await handleMessage({ client, channel, threadKey, threadTs, userText });
+}
+
 app.event('app_mention', async ({ event, client }) => {
   try {
     const threadTs = event.thread_ts || event.ts;
@@ -387,47 +411,40 @@ app.event('app_mention', async ({ event, client }) => {
     const userText = stripMention(event.text || '');
     if (!userText) return;
 
-    if (isPdfRequest(userText)) {
-      const instruction = extractPdfInstruction(userText);
-      if (!instruction) return;
-      await handlePdfRequest({ client, channel: event.channel, threadTs, instruction });
-      return;
-    }
-
-    await handleMessage({
-      client,
-      channel: event.channel,
-      threadKey,
-      threadTs,
-      userText,
-    });
+    await routeIncomingText({ client, channel: event.channel, threadKey, threadTs, userText });
   } catch (error) {
     console.error('Error handling app_mention:', error);
   }
 });
 
-app.message(async ({ message, client }) => {
+app.message(async ({ message, client, context }) => {
   try {
-    if (message.channel_type !== 'im') return;
     if (message.subtype || message.bot_id) return;
 
-    const threadKey = `${message.channel}:dm`;
     const userText = (message.text || '').trim();
     if (!userText) return;
 
-    if (isPdfRequest(userText)) {
-      const instruction = extractPdfInstruction(userText);
-      if (!instruction) return;
-      await handlePdfRequest({
+    if (message.channel_type === 'im') {
+      await routeIncomingText({
         client,
         channel: message.channel,
+        threadKey: `${message.channel}:dm`,
         threadTs: message.thread_ts,
-        instruction,
+        userText,
       });
       return;
     }
 
-    await handleMessage({
+    // Channel/group reply with no @mention: only treat it as directed at the
+    // bot if it's a reply within a thread the bot has already posted into.
+    // Skip if it mentions the bot directly — app_mention already handles that.
+    if (!message.thread_ts) return;
+    if (context.botUserId && userText.includes(`<@${context.botUserId}>`)) return;
+
+    const threadKey = threadKeyFor(message.channel, message.thread_ts);
+    if (!engagedThreads.has(threadKey)) return;
+
+    await routeIncomingText({
       client,
       channel: message.channel,
       threadKey,
@@ -435,7 +452,7 @@ app.message(async ({ message, client }) => {
       userText,
     });
   } catch (error) {
-    console.error('Error handling DM:', error);
+    console.error('Error handling message:', error);
   }
 });
 
