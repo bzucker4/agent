@@ -5,11 +5,13 @@
   "main": "index.js",
   "type": "commonjs",
   "scripts": {
-    "start": "node index.js"
+    "start": "node index.js",
+    "authorize-gmail": "node authorize-gmail.js"
   },
   "dependencies": {
     "@slack/bolt": "^3.19.0",
     "dotenv": "^16.4.5",
+    "googleapis": "^178.0.0",
     "groq-sdk": "^0.7.0",
     "pdf-lib": "^1.17.1"
   }

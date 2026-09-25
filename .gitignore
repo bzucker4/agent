@@ -2,3 +2,5 @@ node_modules/
 .env
 npm-debug.log*
 bot.log
+credentials.json
+token.json
