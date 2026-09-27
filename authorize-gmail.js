@@ -11,7 +11,12 @@ const { google } = require('googleapis');
 
 const CREDENTIALS_PATH = path.join(__dirname, 'credentials.json');
 const TOKEN_PATH = path.join(__dirname, 'token.json');
-const SCOPES = ['https://www.googleapis.com/auth/gmail.send'];
+// userinfo.email only exposes the account's address (not mail contents); the
+// bot reads it at startup so "email me" knows where to send.
+const SCOPES = [
+  'https://www.googleapis.com/auth/gmail.send',
+  'https://www.googleapis.com/auth/userinfo.email',
+];
 // Must match the "http://localhost" redirect URI registered on the Desktop
 // OAuth client (any port is accepted, but Google controls the exact path it
 // redirects to, so no custom path here). Nothing actually listens on this —
