@@ -956,7 +956,8 @@ function buildDigestSystemPrompt(date) {
       'Write the statement itself (e.g. "Cosmic silence is a biological timeline, not an empty sky."), never an instruction ' +
       'to Brian (not "Frame this as..." or "Present the...").',
     'Format each item as:\n1. <one-line description of what is happening>\n   Angle: <the hook>\n   Source: <url> (<publication date>)\n' +
-      'and end with a "Sources" section of markdown links ([Title](url)). If you have fewer than 5 items, start with one line: ' +
+      'and end with a "Sources" section of markdown links ([Title](url)) whose link text is the article\'s actual headline, ' +
+      'never "Link 1", "Source", or the bare URL. If you have fewer than 5 items, start with one line: ' +
       '"Only N items from the last 7 days passed verification this week."',
     'Only include items that appear in your search results, and only use URLs that appear in them; never invent or guess a URL.',
     'Preserve facts from search results exactly, including dates, tense, and numbers.',
@@ -1000,6 +1001,25 @@ function extractPublishedDate(html, url) {
   return null;
 }
 
+function extractPageTitle(html) {
+  const match =
+    html.match(/<meta[^>]+property=["']og:title["'][^>]*content=["']([^"']+)["']/i) ||
+    html.match(/<meta[^>]+content=["']([^"']+)["'][^>]*property=["']og:title["']/i) ||
+    html.match(/<title[^>]*>([^<]+)<\/title>/i);
+  if (!match) return null;
+  const title = match[1]
+    .replace(/&amp;/g, '&')
+    .replace(/&quot;/g, '"')
+    .replace(/&#0?39;|&apos;/g, "'")
+    .replace(/\s+/g, ' ')
+    .trim();
+  return title ? title.slice(0, 150) : null;
+}
+
+// url -> page title, filled in as links are verified, used to replace
+// generic link text ("Link 1") in the Sources section.
+const pageTitles = new Map();
+
 // Returns null if the link is live and recent, or a short reason otherwise.
 async function checkDigestLink(url, now) {
   let response;
@@ -1015,6 +1035,8 @@ async function checkDigestLink(url, now) {
   if (!response.ok) return `could not be verified (HTTP ${response.status})`;
 
   const html = (await response.text()).slice(0, 500000);
+  const title = extractPageTitle(html);
+  if (title) pageTitles.set(url, title);
   const published = extractPublishedDate(html, response.url || url);
   if (!published) return 'has no publication date on the page';
   if (published < digestWindowStart(now)) {
@@ -1060,6 +1082,17 @@ function digestToPlainText(markdown) {
     .replace(/\[([^\]]+)\]\((https?:\/\/[^)\s]+)\)/g, '$1: $2')
     .replace(/\*\*(.+?)\*\*/g, '$1')
     .replace(/(^|\s)\*([^*\n]+)\*(?=[\s.,:;]|$)/gm, '$1$2');
+}
+
+const GENERIC_LINK_TEXT = /^(?:link|source|article|here|read more)?\s*#?\d*$|^https?:\/\//i;
+
+// Backstop for the prompt: swap generic markdown link text for the page's
+// real title, which the link check already fetched.
+function useRealLinkTitles(markdown) {
+  return markdown.replace(/\[([^\]]*)\]\((https?:\/\/[^)\s]+)\)/g, (whole, text, url) => {
+    const title = pageTitles.get(url.replace(/[.,;:!?]+$/, '').replace(/\/+$/, ''));
+    return title && GENERIC_LINK_TEXT.test(text.trim()) ? `[${title.replace(/[[\]]/g, '')}](${url})` : whole;
+  });
 }
 
 function cleanDigest(text) {
@@ -1116,16 +1149,28 @@ async function runWeeklyDigest({ client = app.client } = {}) {
     // check it loads and was published within the window. Failed links go
     // back to the model, first with room to search for replacements, then a
     // final removal-only pass.
+    // A digest with no links at all would skip verification entirely, so
+    // it's sent back for more searching just like one with bad links.
     let problems = await findLinkProblems(digest, startedAt);
-    for (let attempt = 0; problems.length && attempt <= DIGEST_REPLACEMENT_ROUNDS; attempt++) {
+    const hasNoLinks = () => extractUrls(digest).length === 0;
+    for (let attempt = 0; (problems.length || hasNoLinks()) && attempt <= DIGEST_REPLACEMENT_ROUNDS; attempt++) {
       const finalPass = attempt === DIGEST_REPLACEMENT_ROUNDS;
-      console.warn(`[digest] ${problems.length} link(s) failed verification (pass ${attempt + 1}):`, problems);
+      if (!problems.length && finalPass) break; // no links and no searches left: handled below
+      const feedback = problems.length
+        ? 'These links failed automated verification (fetched to check they load and were published in the last 7 days):\n' +
+          problems.map((p) => `- ${p.url} ${p.reason}`).join('\n') +
+          '\n\nRemove every item that uses one of these links, and its Sources entry. '
+        : 'Your digest has no source links. Every item needs the exact URL of a page you opened. ';
+      console.warn(
+        problems.length
+          ? `[digest] ${problems.length} link(s) failed verification (pass ${attempt + 1}):`
+          : `[digest] Digest has no links (pass ${attempt + 1}); asking for more searches.`,
+        problems.length ? problems : ''
+      );
       messages.push({
         role: 'user',
         content:
-          'These links failed automated verification (fetched to check they load and were published in the last 7 days):\n' +
-          problems.map((p) => `- ${p.url} ${p.reason}`).join('\n') +
-          '\n\nRemove every item that uses one of these links, and its Sources entry. ' +
+          feedback +
           (finalPass
             ? 'Do not add new items or links. '
             : 'Then run more searches to find replacement items from the last 7 days on topics not yet covered, citing only pages you opened. ') +
@@ -1149,6 +1194,8 @@ async function runWeeklyDigest({ client = app.client } = {}) {
         digest;
     }
     const verifiedCount = new Set(extractUrls(digest)).size - problems.length;
+    if (verifiedCount === 0) throw new Error('no items from the last 7 days passed link verification this week');
+    digest = useRealLinkTitles(digest);
 
     await sendGmailMessage({
       to: DIGEST_RECIPIENT,
