@@ -90,8 +90,22 @@ const app = new App({
   socketMode: true,
 });
 
+// Chat history lives in Supabase (public.conversations, one row per
+// message) so it survives restarts and redeploys. This Map mirrors recent
+// messages and is only read if Supabase is unconfigured or unreachable.
 // threadKey -> array of { role, content, userId? }, most recent MAX_HISTORY_MESSAGES kept
 const conversations = new Map();
+
+// Talks to Supabase's REST API (PostgREST) directly: the bot only needs a
+// select and an insert, and supabase-js requires Node 22+.
+const SUPABASE_TIMEOUT_MS = 5000;
+const supabase =
+  process.env.SUPABASE_URL && process.env.SUPABASE_SERVICE_KEY
+    ? { url: process.env.SUPABASE_URL.replace(/\/+$/, ''), key: process.env.SUPABASE_SERVICE_KEY }
+    : null;
+if (!supabase) {
+  console.warn('SUPABASE_URL / SUPABASE_SERVICE_KEY not set; conversation history is in-memory only and resets on restart.');
+}
 
 // channel:threadTs keys the bot has actually posted into, so a later reply in
 // that thread can be treated as directed at the bot without needing another
@@ -190,21 +204,58 @@ function truncate(text) {
   return text.slice(0, MAX_MESSAGE_CHARS);
 }
 
-function getHistory(threadKey) {
-  return conversations.get(threadKey) || [];
+// Legacy JWT keys also go in Authorization; new sb_secret_ keys only in apikey.
+async function supabaseRequest(pathAndQuery, init = {}) {
+  const headers = { apikey: supabase.key, 'Content-Type': 'application/json', ...init.headers };
+  if (supabase.key.split('.').length === 3) headers.Authorization = `Bearer ${supabase.key}`;
+  const response = await fetch(`${supabase.url}/rest/v1/${pathAndQuery}`, {
+    ...init,
+    headers,
+    signal: AbortSignal.timeout(SUPABASE_TIMEOUT_MS),
+  });
+  if (!response.ok) throw new Error(`HTTP ${response.status}: ${(await response.text()).slice(0, 200)}`);
+  return response;
 }
 
-function historyAsMessages(threadKey) {
-  return getHistory(threadKey).map(({ role, content }) => ({ role, content }));
+// Last MAX_HISTORY_MESSAGES messages for the thread, oldest first.
+async function getHistory(threadKey) {
+  if (supabase) {
+    try {
+      const query = new URLSearchParams({
+        select: 'role,content,user_id',
+        thread_key: `eq.${threadKey}`,
+        order: 'id.desc',
+        limit: String(MAX_HISTORY_MESSAGES),
+      });
+      const rows = await (await supabaseRequest(`conversations?${query}`)).json();
+      return rows.reverse().map((row) => ({ role: row.role, content: row.content, userId: row.user_id || undefined }));
+    } catch (error) {
+      console.error('Supabase history read failed; using in-memory history:', error.message);
+    }
+  }
+  return conversations.get(threadKey) || [];
 }
 
 // userId is recorded on user turns so draft_email can tell which addresses
 // the authorized user typed themselves vs. someone else in the thread.
-function appendToHistory(threadKey, role, content, userId) {
-  const history = getHistory(threadKey);
-  history.push({ role, content: truncate(content), userId });
+// Never throws: a failed write is logged and the reply still goes out.
+async function appendToHistory(threadKey, role, content, userId) {
+  const entry = { role, content: truncate(content), userId };
+  const history = conversations.get(threadKey) || [];
+  history.push(entry);
   while (history.length > MAX_HISTORY_MESSAGES) history.shift();
   conversations.set(threadKey, history);
+
+  if (!supabase) return;
+  try {
+    await supabaseRequest('conversations', {
+      method: 'POST',
+      headers: { Prefer: 'return=minimal' },
+      body: JSON.stringify({ thread_key: threadKey, role, content: entry.content, user_id: userId || null }),
+    });
+  } catch (error) {
+    console.error('Supabase history write failed:', error.message);
+  }
 }
 
 function stripMention(text) {
@@ -797,9 +848,9 @@ function buildSystemPrompt(userId, threadKey) {
 // message or earlier in the thread, their own Gmail address, and the pending
 // draft's (already-vetted) recipient. Anything else — e.g. an address that
 // only appeared in a search result — is refused.
-function allowedRecipientsFor({ threadKey, userId, userText }) {
+function allowedRecipientsFor({ threadKey, history, userId, userText }) {
   const allowed = new Set(scanEmailAddresses(userText));
-  for (const entry of getHistory(threadKey)) {
+  for (const entry of history) {
     if (entry.role === 'user' && entry.userId === userId) {
       scanEmailAddresses(entry.content).forEach((a) => allowed.add(a));
     }
@@ -959,11 +1010,19 @@ async function handleMessage({ client, channel, threadKey, threadTs, userText, u
   const text = userText.trim();
   if (!text) return;
 
-  const allowedRecipients = allowedRecipientsFor({ threadKey, userId, userText: text });
-  appendToHistory(threadKey, 'user', text, userId);
+  // History is read before this message is stored, then the message is
+  // appended locally; the write runs alongside the model call and is awaited
+  // before the reply is stored, so rows stay in order.
+  const history = await getHistory(threadKey);
+  const allowedRecipients = allowedRecipientsFor({ threadKey, history, userId, userText: text });
+  const userMessageSaved = appendToHistory(threadKey, 'user', text, userId);
+  const context = [...history, { role: 'user', content: truncate(text) }].slice(-MAX_HISTORY_MESSAGES);
 
   const tools = buildTools(userId);
-  const messages = [{ role: 'system', content: buildSystemPrompt(userId, threadKey) }, ...historyAsMessages(threadKey)];
+  const messages = [
+    { role: 'system', content: buildSystemPrompt(userId, threadKey) },
+    ...context.map(({ role, content }) => ({ role, content })),
+  ];
 
   const placeholder = await client.chat.postMessage({ channel, thread_ts: threadTs, text: 'thinking...' });
   const realThreadKey = threadKeyFor(channel, threadTs);
@@ -996,7 +1055,8 @@ async function handleMessage({ client, channel, threadKey, threadTs, userText, u
   }
 
   const reply = toSlackFormatting(finalText.trim() || (turn.postedOutput ? 'Done.' : "I don't have a response for that."));
-  appendToHistory(threadKey, 'assistant', reply);
+  await userMessageSaved;
+  await appendToHistory(threadKey, 'assistant', reply);
 
   // If a tool posted a PDF or draft preview, the placeholder now sits above
   // it; re-post the reply underneath so the thread reads in order.
