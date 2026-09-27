@@ -558,13 +558,22 @@ const DRAFT_EMAIL_TOOL = {
     description:
       "Draft an email for the user to review. This does NOT send it — the user must reply 'send it' to send. " +
       'Write a complete plain-text body (no markdown) with greeting and sign-off. Never leave placeholders ' +
-      "like [Your Name]; if you don't know the sender's name, end the sign-off without one.",
+      "like [Your Name]; if you don't know the sender's name, end the sign-off without one. " +
+      'The body is exactly what the recipient will read: it must not mention drafting, sending, confirming, ' +
+      'or reviewing (e.g. no "Let me know if you\'d like me to send this" or "Here is the draft"), and must not ' +
+      'offer help from you, the assistant (e.g. no "Let me know if you\'d like a PDF version"). ' +
+      'The Slack preview already tells the user how to send it.',
     parameters: {
       type: 'object',
       properties: {
         recipient: { type: 'string', description: 'A single email address' },
         subject: { type: 'string' },
-        body: { type: 'string', description: 'Full plain-text email body, no markdown' },
+        body: {
+          type: 'string',
+          description:
+            'The final email text as the recipient will read it: greeting, content, sign-off. ' +
+            'Plain text, no markdown, and no notes to the user about the draft or sending it.',
+        },
       },
       required: ['recipient', 'subject', 'body'],
     },
@@ -667,7 +676,8 @@ const TOOL_HANDLERS = {
 
     const to = extractEmailAddress(typeof args.recipient === 'string' ? args.recipient : '');
     const subject = typeof args.subject === 'string' ? args.subject.trim() : '';
-    const body = typeof args.body === 'string' ? args.body.trim() : '';
+    // Plain-text email: drop any **bold** markers the model adds anyway.
+    const body = typeof args.body === 'string' ? args.body.replace(/\*\*(.+?)\*\*/g, '$1').trim() : '';
     if (!EMAIL_ADDRESS_REGEX.test(to)) return { error: `"${to}" is not a valid email address.` };
     if (!subject || !body) return { error: 'subject and body are required.' };
     if (!turn.allowedRecipients.has(to.toLowerCase())) {
