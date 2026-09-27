@@ -6,7 +6,8 @@
   "type": "commonjs",
   "scripts": {
     "start": "node index.js",
-    "authorize-gmail": "node authorize-gmail.js"
+    "authorize-gmail": "node authorize-gmail.js",
+    "postinstall": "node scripts/fetch-python-wasm.js"
   },
   "dependencies": {
     "@slack/bolt": "^3.19.0",

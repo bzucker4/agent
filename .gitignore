@@ -4,3 +4,4 @@ npm-debug.log*
 bot.log
 credentials.json
 token.json
+sandbox/python.wasm
