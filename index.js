@@ -402,6 +402,8 @@ const PDF_CHAR_FALLBACKS = {
   '\u2010': '-', '\u2011': '-', '\u2012': '-', '\u2212': '-',
   '\u00a0': ' ', '\u2009': ' ', '\u202f': ' ', '\u2007': ' ',
   '\u2192': '->', '\u2190': '<-', '\u2264': '<=', '\u2265': '>=', '\u2248': '~',
+  // Checkboxes/check marks (common in checklists) aren't in WinAnsi either.
+  '\u2610': '[ ]', '\u2611': '[x]', '\u2612': '[x]', '\u2713': '[x]', '\u2714': '[x]',
 };
 const fontCharsets = new WeakMap();
 
@@ -920,4 +922,4 @@ if (require.main === module) {
 }
 
 // Exported for driving the message pipeline without a Slack connection.
-module.exports = { routeIncomingText, loadOwnEmailAddress, pendingDrafts, gmail };
+module.exports = { routeIncomingText, loadOwnEmailAddress, pendingDrafts, gmail, TOOL_HANDLERS };
